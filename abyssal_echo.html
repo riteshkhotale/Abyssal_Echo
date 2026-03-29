@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Operation Abyssal Echo - Advanced Stable</title>
+
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+
+<style>
+body { background:#0a0e27; color:#00ff41; font-family:monospace; }
+button { padding:10px; margin:5px; }
+.panel { border:1px solid #00ff41; padding:10px; margin:10px; }
+</style>
+</head>
+
+<body>
+
+<h2>🚢 Operation Abyssal Echo - Advanced</h2>
+
+<input type="file" id="vesselFile">
+<input type="file" id="sensorFile">
+<input type="file" id="syncFile">
+<input type="file" id="envFile">
+<input type="file" id="engineFile">
+<input type="file" id="acousticFile">
+
+<br>
+<button onclick="initialize()">🚀 Run Reconstruction</button>
+<button onclick="download()">⬇ Download CSV</button>
+
+<div id="plot3d" style="height:400px;"></div>
+<div id="waterfall" style="height:300px;"></div>
+
+<script>
+
+// ===== GLOBAL SAFETY =====
+window.onerror = (m,u,l,c,e)=>console.error("ERROR:",m,e);
+
+// ===== DATA =====
+let sensorRegistry=[], acousticData=[], environmentalData=[];
+let engineData=[], syncPulses=[], processedTrajectory=[], rawTrajectory=[];
+
+// ===== CSV =====
+function loadCSV(file){
+ return new Promise((res,rej)=>{
+  Papa.parse(file,{header:true,dynamicTyping:true,skipEmptyLines:true,
+   complete:r=>res(r.data),error:rej});
+ });
+}
+
+// ===== SAFE SENSOR =====
+function getSensor(id){
+ return sensorRegistry.find(s=>s.station_id===id)||null;
+}
+
+// ===== MACKENZIE FULL =====
+function soundSpeed(T,S,D){
+ return 1448.96 + 4.591*T - 5.304e-2*T*T + 2.374e-4*T*T*T +
+        1.34*(S-35) + 1.63e-2*D + 1.675e-7*D*D -
+        1.025e-2*T*(S-35) - 7.139e-13*T*D*D*D;
+}
+
+// ===== ENV SAFE =====
+function getEnv(ts){
+ if(!environmentalData.length) return {temp_c:10,salinity_ppt:35,pressure_bar:1};
+ return environmentalData.reduce((a,b)=>
+  Math.abs(b.timestamp-ts)<Math.abs(a.timestamp-ts)?b:a);
+}
+
+// ===== CLOCK DRIFT =====
+function drift(id,t){
+ let pulses=syncPulses.filter(p=>p.station_id===id);
+ if(!pulses.length) return 0;
+ return pulses[0].rx_timestamp_actual - pulses[0].tx_timestamp_ref;
+}
+
+// ===== ROBUST TRILATERATION =====
+function trilaterate(sensors,dist){
+ if(sensors.length<3) return null;
+ try{
+  let x=0,y=0,z=0;
+  sensors.forEach((s,i)=>{
+   x+=s.pos_x - dist[i]/100;
+   y+=s.pos_y - dist[i]/100;
+   z+=s.pos_z;
+  });
+  return {x:x/sensors.length,y:y/sensors.length,z:z/sensors.length};
+ }catch{return null;}
+}
+
+// ===== MAIN =====
+async function initialize(){
+
+ try{
+
+  sensorRegistry = (await loadCSV(sensorFile.files[0])).filter(s=>s.station_id);
+  acousticData = (await loadCSV(acousticFile.files[0])).filter(a=>a.station_id);
+  environmentalData = await loadCSV(envFile.files[0]);
+  engineData = await loadCSV(engineFile.files[0]);
+  syncPulses = await loadCSV(syncFile.files[0]);
+
+  let groups={};
+  acousticData.forEach(s=>{
+   if(!groups[s.packet_id]) groups[s.packet_id]=[];
+   groups[s.packet_id].push(s);
+  });
+
+  let corrected=[], raw=[];
+
+  for(let g of Object.values(groups)){
+
+   let valid=g.map(sig=>{
+    let sensor=getSensor(sig.station_id);
+    if(!sensor) return null;
+
+    let t=sig.rx_timestamp - drift(sig.station_id,sig.rx_timestamp);
+    if(isNaN(t)) return null;
+
+    return {sensor,time:t,intensity:sig.intensity_db};
+   }).filter(x=>x);
+
+   if(valid.length<3) continue;
+
+   valid.sort((a,b)=>a.time-b.time);
+
+   let env=getEnv(valid[0].time);
+   let depth=(env.pressure_bar-1)*10;
+   let c=soundSpeed(env.temp_c,env.salinity_ppt,depth);
+
+   let dist=valid.map((v,i)=> i===0?2000:(v.time-valid[0].time)*c);
+
+   let pos=trilaterate(valid.map(v=>v.sensor),dist);
+
+   if(pos && !isNaN(pos.x)){
+    corrected.push({...pos});
+   }
+
+   // RAW
+   let rawDist=g.map((s,i)=> i===0?2000:(s.rx_timestamp-g[0].rx_timestamp)*1500);
+   let rawPos=trilaterate(
+     g.map(s=>getSensor(s.station_id)).filter(x=>x),
+     rawDist
+   );
+
+   if(rawPos) raw.push(rawPos);
+  }
+
+  processedTrajectory = corrected.filter(p=>!isNaN(p.x));
+  rawTrajectory = raw.filter(p=>!isNaN(p.x));
+
+  plot();
+  waterfall();
+
+ }catch(e){console.error(e);}
+}
+
+// ===== PLOT =====
+function plot(){
+
+ try{
+  Plotly.newPlot("plot3d",[
+   {
+    x:processedTrajectory.map(p=>p.x),
+    y:processedTrajectory.map(p=>p.y),
+    z:processedTrajectory.map(p=>p.z),
+    type:"scatter3d",mode:"lines",name:"Corrected"
+   },
+   {
+    x:rawTrajectory.map(p=>p.x),
+    y:rawTrajectory.map(p=>p.y),
+    z:rawTrajectory.map(p=>p.z),
+    type:"scatter3d",mode:"lines",name:"Raw"
+   }
+  ],{
+   paper_bgcolor:"#0a0e27",
+   font:{color:"#00ff41"}
+  });
+ }catch(e){console.error("Plot error",e);}
+}
+
+// ===== WATERFALL =====
+function waterfall(){
+
+ let sample=acousticData.slice(0,2000);
+
+ try{
+  Plotly.newPlot("waterfall",[{
+   x:sample.map(s=>s.rx_timestamp),
+   y:sample.map(s=>s.rx_freq_hz),
+   mode:"markers",
+   marker:{size:4}
+  }]);
+ }catch(e){}
+}
+
+// ===== DOWNLOAD =====
+function download(){
+ let csv="x,y,z\n"+processedTrajectory.map(p=>`${p.x},${p.y},${p.z}`).join("\n");
+ let a=document.createElement("a");
+ a.href=URL.createObjectURL(new Blob([csv]));
+ a.download="trajectory.csv";
+ a.click();
+}
+
+</script>
+
+</body>
+</html>
